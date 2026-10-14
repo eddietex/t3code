@@ -76,9 +76,10 @@ keyboard. The button only offers Steer when the running agent supports it.
 
 On web and desktop, maximizing the right panel on a diff, file, or pull request
 keeps the composer within reach as a small pill at the bottom of the panel. Hover
-or click the pill to open the composer. It tucks away again once you move back to
-the code, and your draft stays in it. The pill also shows when the agent is
-working or waiting on an approval or an answer.
+or click the pill to open the composer. It tucks away when you move the pointer off
+it; once you have started typing, it stays open until you click back into the code.
+Your draft stays in it. The pill also shows when the agent is working or waiting on
+an approval or an answer.
 
 ## Queue messages offline on mobile
 

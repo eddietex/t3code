@@ -14,22 +14,31 @@ const STATUS_LABEL: Record<FloatingComposerStatus, string> = {
   input: "Needs input",
 };
 
+/** A collapsed composer never keeps focus, or typing would land out of sight. */
+function releaseFocus(stack: HTMLElement | null) {
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && stack?.contains(active)) active.blur();
+}
+
 /**
  * The composer stack. While `floating`, the composer sits over a maximized
  * right panel and collapses to a pill: hovering or focusing it opens the
- * composer, which closes again once the pointer and focus have both left.
- * React bubbles those events through portals, so the composer's own menus
- * keep it open. `onOpen` should move focus into the composer.
+ * composer. Leaving with the pointer closes it unless `hasDraft` reports work
+ * in progress, which focus keeps open until focus leaves too. React bubbles
+ * these events through portals, so the composer's own menus keep it open.
+ * `onOpen` should move focus into the composer.
  */
 export function FloatingComposerStack({
   floating,
   status,
   onOpen,
+  hasDraft,
   children,
 }: {
   floating: boolean;
   status: FloatingComposerStatus;
   onOpen: () => void;
+  hasDraft: () => boolean;
   children: ReactNode;
 }) {
   const stackRef = useRef<HTMLDivElement | null>(null);
@@ -46,8 +55,7 @@ export function FloatingComposerStack({
     const handlePointerDown = (event: PointerEvent) => {
       if (insidePressRef.current === event) return;
       setHovered(false);
-      const active = document.activeElement;
-      if (active instanceof HTMLElement && stackRef.current?.contains(active)) active.blur();
+      releaseFocus(stackRef.current);
     };
     document.addEventListener("pointerdown", handlePointerDown);
     return () => document.removeEventListener("pointerdown", handlePointerDown);
@@ -66,7 +74,11 @@ export function FloatingComposerStack({
       onPointerEnter={(event) => {
         if (event.pointerType !== "touch") setHovered(true);
       }}
-      onPointerLeave={() => setHovered(false)}
+      onPointerLeave={() => {
+        setHovered(false);
+        // An empty composer, such as right after a send, tucks away with the pointer.
+        if (floating && !hasDraft()) releaseFocus(stackRef.current);
+      }}
       onPointerDownCapture={(event) => {
         insidePressRef.current = event.nativeEvent;
       }}

@@ -4622,6 +4622,13 @@ export default function ChatView(props: ChatViewProps) {
   const focusComposer = useCallback(() => {
     composerRef.current?.focusAtEnd();
   }, [composerRef]);
+  const composerHasDraft = useCallback(
+    () =>
+      composerDraftHasUserContent(
+        useComposerDraftStore.getState().getComposerDraft(composerDraftTarget),
+      ),
+    [composerDraftTarget],
+  );
   const canInterruptRunningThread =
     canOperateThread && deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
   const onInterrupt = useCallback(async () => {
@@ -11751,6 +11758,7 @@ export default function ChatView(props: ChatViewProps) {
                   floating={composerFloats}
                   status={floatingComposerStatus}
                   onOpen={focusComposer}
+                  hasDraft={composerHasDraft}
                 >
                   {isDraftHeroState ? (
                     <div className="absolute inset-x-0 bottom-full">
