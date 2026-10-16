@@ -502,6 +502,7 @@ import { ThreadStatusLine } from "./chat/ThreadStatusLine";
 import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
 import { ComposerSurface } from "./chat/ComposerSurface";
 import { resolveThreadSyncPhase } from "../threadSync";
+import { FloatingComposerStack } from "./chat/FloatingComposerStack";
 import {
   hasAvailableCompactionProvider,
   hasDismissedResumeCompaction,
@@ -720,6 +721,17 @@ const DevicePanel = lazy(() =>
 );
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
+/**
+ * Maximized surfaces the composer floats over. A terminal, browser, or device
+ * keeps its whole viewport.
+ */
+const FLOATING_COMPOSER_SURFACE_KINDS: ReadonlySet<RightPanelSurface["kind"]> = new Set([
+  "diff",
+  "files",
+  "file",
+  "pull-request",
+  "pull-requests",
+]);
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
   "textarea",
@@ -4184,6 +4196,18 @@ export default function ChatView(props: ChatViewProps) {
     panelAnimationDurationMs,
   );
   const captureDraftHeroComposerRect = draftHeroTransition.captureComposerRect;
+  const composerFloats =
+    rightPanelMaximized &&
+    !isDraftHeroState &&
+    activeRightPanelKind !== null &&
+    FLOATING_COMPOSER_SURFACE_KINDS.has(activeRightPanelKind);
+  const floatingComposerStatus = activePendingApproval
+    ? "approval"
+    : activePendingUserInput
+      ? "input"
+      : isWorking
+        ? "working"
+        : "idle";
   const { turnDiffSummaries } = useTurnDiffSummaries(serverProjection);
 
   /**
@@ -11158,7 +11182,13 @@ export default function ChatView(props: ChatViewProps) {
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-col overflow-x-hidden",
-          rightPanelMaximized ? "w-0 flex-none" : "flex-1",
+          // Over a maximized review panel the column stays laid out but hidden,
+          // so the floating composer can show through it.
+          rightPanelMaximized
+            ? composerFloats
+              ? "invisible absolute inset-0 z-30"
+              : "w-0 flex-none"
+            : "flex-1",
         )}
         data-chat-column-maximized-away={rightPanelMaximized ? "true" : "false"}
       >
@@ -11204,7 +11234,14 @@ export default function ChatView(props: ChatViewProps) {
         </header>
 
         {/* Main content area with optional plan sidebar */}
-        <div className="relative flex min-h-0 min-w-0 flex-1">
+        <div
+          className={cn(
+            "flex min-h-0 min-w-0",
+            // Floating, the conversation spans the whole view so the composer
+            // sits at its bottom edge, not above the hidden terminal drawer.
+            composerFloats ? "absolute inset-0" : "relative flex-1",
+          )}
+        >
           {/* Chat column */}
           <ThreadFindCanvas
             findOptions={{
@@ -11429,11 +11466,20 @@ export default function ChatView(props: ChatViewProps) {
             >
               <div
                 ref={draftHeroTransition.transitionGroupRef}
-                className="chat-composer-lane w-full"
+                className={cn(
+                  "chat-composer-lane w-full",
+                  // The cards the lane makes room for are hidden with the chat,
+                  // so a floating composer centers on the panel.
+                  composerFloats && "[--chat-lane-inset-end:0px] [--chat-lane-inset-start:0px]",
+                )}
               >
-                <div
-                  data-chat-composer-stack="true"
-                  className="group/composer-stack pointer-events-auto relative z-10 mx-auto w-full max-w-(--chat-content-max-width)"
+                <FloatingComposerStack
+                  floating={composerFloats}
+                  status={floatingComposerStatus}
+                  workStartedAt={activeWorkStartedAt}
+                  sentAt={localDispatchStartedAt}
+                  onOpen={focusComposer}
+                  onShowChat={toggleRightPanelMaximized}
                 >
                   {isDraftHeroState ? (
                     <div className="absolute inset-x-0 bottom-full">
@@ -11735,7 +11781,7 @@ export default function ChatView(props: ChatViewProps) {
                       className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
                     />
                   </div>
-                </div>
+                </FloatingComposerStack>
               </div>
             </div>
 

@@ -72,6 +72,13 @@ running the send button shows which action it will take. Long-press it to use th
 other action for a single message, or hold `Cmd` while sending from a hardware
 keyboard. The button only offers Steer when the running agent supports it.
 
+## Message while reviewing
+
+On web and desktop, maximizing the right panel on a diff, file, or pull request
+shrinks the composer to a pill at the bottom of the panel. Click it to write a
+message; your draft is kept, and the composer tucks away again when you send,
+press `Escape`, or minimize it. An approval or question opens it until you answer.
+
 ## Queue messages offline on mobile
 
 Mobile keeps local copies of draft attachments, so you can preview them and queue
