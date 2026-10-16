@@ -498,6 +498,7 @@ import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timest
 import { ComposerSurface } from "./chat/ComposerSurface";
 import { resolveThreadSyncPhase } from "../threadSync";
 import { FloatingComposerStack } from "./chat/FloatingComposerStack";
+import { floatingActivityHeading, floatingReplyPreview } from "./chat/floatingComposer.logic";
 import {
   hasAvailableCompactionProvider,
   hasDismissedResumeCompaction,
@@ -4133,6 +4134,18 @@ export default function ChatView(props: ChatViewProps) {
       : isWorking
         ? "working"
         : "idle";
+  const floatingRunId = activeActivityRun?.runId ?? null;
+  const floatingActivity = useMemo(
+    () =>
+      composerFloats && floatingComposerStatus === "working"
+        ? floatingActivityHeading(serverVisibleTurnItems, floatingRunId)
+        : null,
+    [composerFloats, floatingComposerStatus, floatingRunId, serverVisibleTurnItems],
+  );
+  const floatingReply = useMemo(
+    () => (composerFloats ? floatingReplyPreview(serverVisibleTurnItems, floatingRunId) : null),
+    [composerFloats, floatingRunId, serverVisibleTurnItems],
+  );
   const { turnDiffSummaries } = useTurnDiffSummaries(serverProjection);
 
   /**
@@ -4622,13 +4635,6 @@ export default function ChatView(props: ChatViewProps) {
   const focusComposer = useCallback(() => {
     composerRef.current?.focusAtEnd();
   }, [composerRef]);
-  const composerHasDraft = useCallback(
-    () =>
-      composerDraftHasUserContent(
-        useComposerDraftStore.getState().getComposerDraft(composerDraftTarget),
-      ),
-    [composerDraftTarget],
-  );
   const canInterruptRunningThread =
     canOperateThread && deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
   const onInterrupt = useCallback(async () => {
@@ -11757,8 +11763,13 @@ export default function ChatView(props: ChatViewProps) {
                 <FloatingComposerStack
                   floating={composerFloats}
                   status={floatingComposerStatus}
+                  workStartedAt={activeWorkStartedAt}
+                  activity={floatingActivity}
+                  reply={floatingReply}
+                  threadTitle={activeThread.title}
                   onOpen={focusComposer}
-                  hasDraft={composerHasDraft}
+                  onShowChat={toggleRightPanelMaximized}
+                  hasDraft={composerHasDraftContent}
                 >
                   {isDraftHeroState ? (
                     <div className="absolute inset-x-0 bottom-full">
