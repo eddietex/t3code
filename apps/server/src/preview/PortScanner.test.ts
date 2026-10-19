@@ -50,17 +50,34 @@ const layerProbeFailure = (
   run: ProcessRunner.ProcessRunner["Service"]["run"],
   fetch: typeof globalThis.fetch = globalThis.fetch,
   fileSystem: Layer.Layer<FileSystem.FileSystem> = layerNoProc,
+  platform: NodeJS.Platform = "linux",
 ) =>
   PortScanner.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         fileSystem,
         Layer.succeed(ProcessRunner.ProcessRunner, { run }),
-        Layer.succeed(HostProcess.Platform, "linux"),
+        Layer.succeed(HostProcess.Platform, platform),
         FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetch))),
       ),
     ),
   );
+
+const successfulLsof =
+  (stdout: string, onRun?: () => void): ProcessRunner.ProcessRunner["Service"]["run"] =>
+  () => {
+    onRun?.();
+    return Effect.succeed({
+      stdout,
+      stderr: "",
+      code: null,
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      stdoutInvalidUtf8: false,
+      stderrInvalidUtf8: false,
+    });
+  };
 
 const layerTestPortDiscovery = PortScanner.layer.pipe(
   Layer.provide(
@@ -678,11 +695,60 @@ const PROC_NET_TCP6 = `  sl  local_address                         remote_addres
    0: 00000000000000000000000000000000:0BB9 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 5004 1 0000000000000000 100 0 0 10 0
 `;
 
+const makeLinuxProcFileSystem = (input: {
+  readonly fdTargets: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  readonly inaccessibleDirectories?: ReadonlySet<string>;
+  readonly inaccessibleLinks?: ReadonlySet<string>;
+}) => {
+  const fdDirectoryReads: string[] = [];
+  const missing = FileSystem.makeNoop({});
+  const fileSystem = FileSystem.layerNoop({
+    readDirectory: (path) => {
+      const [, pid] = /^\/proc\/(\d+)\/fd$/.exec(path) ?? [];
+      if (pid === undefined) return missing.readDirectory(path);
+      fdDirectoryReads.push(pid);
+      if (input.inaccessibleDirectories?.has(pid)) {
+        return Effect.fail(
+          PlatformError.systemError({
+            _tag: "PermissionDenied",
+            module: "FileSystem",
+            method: "readDirectory",
+            pathOrDescriptor: path,
+            description: "The test process cannot inspect this descriptor directory.",
+          }),
+        );
+      }
+      const targets = input.fdTargets[pid];
+      return targets === undefined
+        ? missing.readDirectory(path)
+        : Effect.succeed(Object.keys(targets));
+    },
+    readLink: (path) => {
+      const [, pid, fd] = /^\/proc\/(\d+)\/fd\/(\d+)$/.exec(path) ?? [];
+      if (pid === undefined || fd === undefined) return missing.readLink(path);
+      if (input.inaccessibleLinks?.has(path)) {
+        return Effect.fail(
+          PlatformError.systemError({
+            _tag: "PermissionDenied",
+            module: "FileSystem",
+            method: "readLink",
+            pathOrDescriptor: path,
+            description: "The test process cannot read this descriptor link.",
+          }),
+        );
+      }
+      const target = input.fdTargets[pid]?.[fd];
+      return target === undefined ? missing.readLink(path) : Effect.succeed(target);
+    },
+  });
+  return { fileSystem, fdDirectoryReads };
+};
+
 effectIt.effect(
   "reads Linux listeners from /proc when lsof is missing, and stops spawning it",
   () => {
     let lsofSpawns = 0;
-    const fdWalks: string[] = [];
+    let ownershipWalks = 0;
     const procFiles: Record<string, string> = {
       "/proc/net/tcp": PROC_NET_TCP,
       "/proc/net/tcp6": PROC_NET_TCP6,
@@ -699,11 +765,13 @@ effectIt.effect(
         return content === undefined ? missing.readFileString(path) : Effect.succeed(content);
       },
       readDirectory: (path) => {
-        if (path === "/proc") return Effect.succeed(["self", "77", "4242"]);
+        if (path === "/proc") {
+          ownershipWalks += 1;
+          return Effect.succeed(["self", "77", "4242"]);
+        }
         const pid = /^\/proc\/(\d+)\/fd$/.exec(path)?.[1];
         const fds = pid === undefined ? undefined : procFds[pid];
         if (pid === undefined || fds === undefined) return missing.readDirectory(path);
-        fdWalks.push(pid);
         return Effect.succeed(Object.keys(fds));
       },
       readLink: (path) => {
@@ -733,13 +801,177 @@ effectIt.effect(
       ]);
       yield* scanner.scan();
       expect(lsofSpawns).toBe(1);
-      expect(fdWalks).toEqual(["77", "4242", "77", "4242"]);
+      expect(ownershipWalks).toBe(2);
       yield* scanner.scan();
       yield* scanner.scan();
-      expect(fdWalks).toEqual(["77", "4242", "77", "4242", "77", "4242"]);
+      expect(ownershipWalks).toBe(3);
     }).pipe(Effect.provide(layer));
   },
 );
+
+effectIt.effect(
+  "skips discovery for registered idle terminal children, then scans when one owns a socket",
+  () => {
+    const fdTargets: Record<string, Record<string, string>> = {
+      // These are registered child processes; idle shell terminals are not registered.
+      "7101": { "0": "/dev/null", "1": "pipe:[71011]", "2": "pipe:[71012]" },
+      "7102": { "0": "/dev/pts/2", "1": "pipe:[71021]", "2": "pipe:[71022]" },
+    };
+    const proc = makeLinuxProcFileSystem({
+      fdTargets,
+    });
+    let lsofSpawns = 0;
+    const requests: string[] = [];
+    const fetchFn = ((input: Parameters<typeof globalThis.fetch>[0]) => {
+      requests.push(String(input));
+      return Promise.resolve(new Response("hello", { headers: { "content-type": "text/html" } }));
+    }) as typeof globalThis.fetch;
+    const layer = layerProbeFailure(
+      successfulLsof(`p7102\ncvim\nn*:${LSOF_TEST_PORT}\n`, () => {
+        lsofSpawns += 1;
+      }),
+      fetchFn,
+      proc.fileSystem,
+    );
+
+    return Effect.gen(function* () {
+      const scanner = yield* ownedScanner([7101, 7102]);
+      expect(yield* scanner.scan()).toEqual([]);
+      expect(lsofSpawns).toBe(0);
+      expect(requests).toEqual([]);
+      expect(proc.fdDirectoryReads.toSorted()).toEqual(["7101", "7102"]);
+
+      fdTargets["7102"]!["3"] = "socket:[97102]";
+      const servers = yield* scanner.scan();
+      expect(servers).toMatchObject([
+        {
+          port: LSOF_TEST_PORT,
+          pid: 7102,
+          processName: "vim",
+          terminal: { threadId: "scanner-thread", terminalId: "scanner-terminal" },
+        },
+      ]);
+      expect(lsofSpawns).toBe(1);
+      expect(requests).toEqual([`http://localhost:${LSOF_TEST_PORT}/`]);
+
+      delete fdTargets["7102"]!["3"];
+      expect(yield* scanner.scan()).toEqual([]);
+      expect(lsofSpawns).toBe(1);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+effectIt.effect.each(["fd directory", "descriptor link"] as const)(
+  "falls back to lsof when a registered process %s is inaccessible",
+  (failurePoint) => {
+    const proc = makeLinuxProcFileSystem({
+      fdTargets: { "7201": { "0": "/dev/null", "1": "pipe:[72011]" } },
+      ...(failurePoint === "fd directory"
+        ? { inaccessibleDirectories: new Set(["7201"]) }
+        : { inaccessibleLinks: new Set(["/proc/7201/fd/1"]) }),
+    });
+    let lsofSpawns = 0;
+    const requests: string[] = [];
+    const fetchFn = ((input: Parameters<typeof globalThis.fetch>[0]) => {
+      requests.push(String(input));
+      return Promise.resolve(new Response("hello", { headers: { "content-type": "text/html" } }));
+    }) as typeof globalThis.fetch;
+    const layer = layerProbeFailure(
+      successfulLsof(`p7201\ncmake\nn*:${LSOF_TEST_PORT}\n`, () => {
+        lsofSpawns += 1;
+      }),
+      fetchFn,
+      proc.fileSystem,
+    );
+
+    return Effect.gen(function* () {
+      const scanner = yield* ownedScanner([7201]);
+      expect(yield* scanner.scan()).toMatchObject([{ port: LSOF_TEST_PORT, pid: 7201 }]);
+      expect(lsofSpawns).toBe(1);
+      expect(requests).toEqual([`http://localhost:${LSOF_TEST_PORT}/`]);
+      expect(proc.fdDirectoryReads).toEqual(["7201"]);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+effectIt.effect(
+  "falls back to lsof when registered descriptors exceed the idle check budget",
+  () => {
+    const proc = makeLinuxProcFileSystem({
+      fdTargets: {
+        "7301": Object.fromEntries(
+          Array.from({ length: 129 }, (_, index) => [String(index), "/dev/null"]),
+        ),
+      },
+    });
+    let lsofSpawns = 0;
+    const fetchFn = (() =>
+      Promise.resolve(
+        new Response("hello", { headers: { "content-type": "text/html" } }),
+      )) as typeof globalThis.fetch;
+    const layer = layerProbeFailure(
+      successfulLsof(`p7301\nchtop\nn*:${LSOF_TEST_PORT}\n`, () => {
+        lsofSpawns += 1;
+      }),
+      fetchFn,
+      proc.fileSystem,
+    );
+
+    return Effect.gen(function* () {
+      const scanner = yield* ownedScanner([7301]);
+      expect(yield* scanner.scan()).toMatchObject([{ port: LSOF_TEST_PORT, pid: 7301 }]);
+      expect(lsofSpawns).toBe(1);
+      expect(proc.fdDirectoryReads).toEqual(["7301"]);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+effectIt.effect("keeps configured URL probes active for an idle registered child", () => {
+  const configuredUrl = `http://localhost:${LSOF_TEST_PORT}/docs`;
+  const proc = makeLinuxProcFileSystem({
+    fdTargets: { "7401": { "0": "/dev/null", "1": "pipe:[74011]" } },
+  });
+  const requests: string[] = [];
+  const fetchFn = ((input: Parameters<typeof globalThis.fetch>[0]) => {
+    requests.push(String(input));
+    return Promise.resolve(new Response("docs", { headers: { "content-type": "text/html" } }));
+  }) as typeof globalThis.fetch;
+  const layer = layerProbeFailure(successfulLsof(""), fetchFn, proc.fileSystem);
+
+  return Effect.gen(function* () {
+    const scanner = yield* ownedScanner([7401]);
+    expect(yield* scanner.scan([configuredUrl])).toMatchObject([
+      { port: LSOF_TEST_PORT, url: configuredUrl },
+    ]);
+    expect(requests).toEqual([configuredUrl]);
+  }).pipe(Effect.provide(layer));
+});
+
+effectIt.effect("keeps Darwin listener discovery on the lsof path", () => {
+  const proc = makeLinuxProcFileSystem({
+    fdTargets: { "7501": { "0": "/dev/null", "1": "pipe:[75011]" } },
+  });
+  let lsofSpawns = 0;
+  const fetchFn = (() =>
+    Promise.resolve(
+      new Response("hello", { headers: { "content-type": "text/html" } }),
+    )) as typeof globalThis.fetch;
+  const layer = layerProbeFailure(
+    successfulLsof(`p7501\nctail\nn*:${LSOF_TEST_PORT}\n`, () => {
+      lsofSpawns += 1;
+    }),
+    fetchFn,
+    proc.fileSystem,
+    "darwin",
+  );
+
+  return Effect.gen(function* () {
+    const scanner = yield* ownedScanner([7501]);
+    expect(yield* scanner.scan()).toMatchObject([{ port: LSOF_TEST_PORT, pid: 7501 }]);
+    expect(lsofSpawns).toBe(1);
+    expect(proc.fdDirectoryReads).toEqual([]);
+  }).pipe(Effect.provide(layer));
+});
 
 effectIt.effect("keeps spawning lsof after a spawn failure that is not a missing command", () => {
   let lsofSpawns = 0;

@@ -52,6 +52,8 @@ export class PortDiscovery extends Context.Service<
 const POLL_INTERVAL = Duration.seconds(3);
 const LSOF_TIMEOUT_MS = 5_000;
 const PROC_FD_WALK_LIMIT = 50_000;
+// Bound the speculative idle check before falling back to the full scan.
+const IDLE_FD_WALK_LIMIT = 128;
 const SOCKET_OWNER_ATTEMPTS = 3;
 const WINDOWS_LISTENER_TIMEOUT_MS = 5_000;
 /** `netstat -ano` lists every connection, not just listeners; ~80 bytes per row, sized for ~200k rows. */
@@ -392,6 +394,24 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
   >(new Map());
   const socketOwnerMissesRef = yield* Ref.make<ReadonlyMap<string, number>>(new Map());
 
+  const terminalProcessesHaveNoSockets = Effect.fnUntraced(function* (
+    processIds: Iterable<number>,
+  ) {
+    let budget = IDLE_FD_WALK_LIMIT;
+    for (const pid of processIds) {
+      const fds = yield* fileSystem.readDirectory(`/proc/${pid}/fd`);
+      if (fds.length > budget) return false;
+      budget -= fds.length;
+      const socket = yield* Effect.findFirst(fds, (fd) =>
+        fileSystem
+          .readLink(`/proc/${pid}/fd/${fd}`)
+          .pipe(Effect.map((target) => target.startsWith("socket:["))),
+      );
+      if (Option.isSome(socket)) return false;
+    }
+    return true;
+  });
+
   const findSocketOwners = Effect.fn("PortDiscovery.findSocketOwners")(function* (
     inodes: ReadonlySet<string>,
   ) {
@@ -693,6 +713,16 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       }
     }
     if (terminalByProcessId.size === 0 && configuredUrls.length === 0) {
+      return { discovered: [], configured: new Map() } satisfies WebProbeSnapshot;
+    }
+    // Only registered owners are probed, so socket-free commands cannot produce a result.
+    if (
+      hostPlatform === "linux" &&
+      configuredUrls.length === 0 &&
+      (yield* terminalProcessesHaveNoSockets(terminalByProcessId.keys()).pipe(
+        Effect.catchTags({ PlatformError: () => Effect.succeed(false) }),
+      ))
+    ) {
       return { discovered: [], configured: new Map() } satisfies WebProbeSnapshot;
     }
     if (hostPlatform === "win32") {
